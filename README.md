@@ -1,122 +1,217 @@
-Perfect 👌 Thanks for sharing the structure. Here’s a polished `README.md` draft for your project:
 # Decision Tree in PostgreSQL for In-Database Machine Learning
 
-This project implements **CART regression trees inside PostgreSQL** using SQL extensions, with baselines in R (RPART) and Python (Scikit-Learn) for comparison. It demonstrates how in-database machine learning can eliminate the need for data export, reducing overhead and improving scalability.
+This repository contains all codes for experiments and visualisations for the MSc Dissertation titled:
+
+**"In-Database Regression Tree Implementation in PostgreSQL"**
 
 ---
 
-## 📂 Project Structure
+## Overview
 
+This project implements **CART regression trees natively inside PostgreSQL** using SQL user-defined functions (UDFs) and user-defined aggregates (UDAs).  
+
+The aim is to benchmark in-database tree training and prediction against standard machine learning baselines (**R RPART** and **Scikit-Learn**) while exploring **single-table** vs **join-aware** relational setups.  
+
+* Methods: **SQL-based regression trees**, **RPART**, **Scikit-Learn**
+* Experiments: preprocessing, baselines, single-table in-database ML, join-aware in-database ML
+* Outputs: evaluation metrics, predictions, visualisations
+
+---
+
+## Environment & install
+
+* **PostgreSQL:** ≥ 14 (with PL/pgSQL enabled)
+* **Python:** ≥ 3.9 (tested with 3.9–3.11)
+* **R:** ≥ 4.0 (for RPART baseline)
+* **Jupyter Notebook** for running `.ipynb`
+
+### Python dependencies
 ```bash
-CodeBase
-├── Baselines
-│   ├── RPART
-│   │   ├── RPART with joins.ipynb              # R-based regression tree on joined dataset
-│   │   └── RPART with single table.ipynb       # R-based regression tree on flat single-table data
-│   └── SCIKIT LEARN
-│       ├── Scikit Learn with joins.ipynb       # Python baseline (sklearn) with joins
-│       └── Scikit Learn with single table.ipynb# Python baseline (sklearn) with single table
-│
-├── EDA and Preprocessing
-│   └── Preprocessing.ipynb                     # Data cleaning, feature engineering, preprocessing
-│
-├── In Database ML
-│   ├── Join aware
-│   │   ├── build_tree_recursive_joined.sql     # Recursive tree builder for joined schema
-│   │   ├── calculate_node_stats_joined.sql     # Compute node-level statistics
-│   │   ├── dt_c_extension.txt                  # Notes on C extension for PostgreSQL
-│   │   ├── dt_schema.sql                       # Database schema setup for decision tree
-│   │   ├── evaluate_tree_joined.sql            # Evaluate predictions on joined schema
-│   │   ├── find_best_categorical_split_joined.sql # Find best categorical splits
-│   │   ├── find_best_split_all_features_joined.sql # Find best split across all features
-│   │   └── train_regression_tree_joined.sql    # Top-level training function
-│   │
-│   ├── Single table
-│   │   ├── build_tree_recursive.sql            # Recursive tree builder for single table
-│   │   ├── evaluate_treee.sql                  # Evaluate predictions
-│   │   ├── Evaluation.py                       # Python helper for evaluation/benchmarking
-│   │   ├── find_all_numeric_splits_one_pass.sql# Optimized numeric split search
-│   │   ├── find_best_categorical_split.sql     # Find best categorical splits
-│   │   ├── find_best_split_all_features.sql    # Unified best split search
-│   │   ├── predict_tree.sql                    # Prediction function
-│   │   ├── train_regression_tree.sql           # Top-level training function
-│   │   └── traverse_tree_from_json.sql         # Tree traversal from JSON representation
-│   │
-│   └── Visualisation.ipynb                     # Visualizations and result interpretation
-│
-└── output.txt                                  # Placeholder for generated outputs/logs
+pip install -r requirements.txt
 ````
 
----
+(required packages: `pandas`, `numpy`, `scikit-learn`, `matplotlib`, `jupyter`)
 
-## ⚙️ Setup Instructions
+### Database setup
 
-1. **Install Dependencies**
+```sql
+-- inside psql
+\i "In Database ML/Join aware/dt_schema.sql"
+```
 
-   * PostgreSQL (≥ 14 recommended)
-   * Python 3.9+ with `pandas`, `numpy`, `scikit-learn`, `matplotlib`
-   * R (≥ 4.0) with `rpart`
-   * Jupyter Notebook for running `.ipynb` files
-
-2. **Database Setup**
-
-   * Load the schema:
-
-     ```sql
-     \i In Database ML/Join aware/dt_schema.sql
-     ```
-   * Optionally, adjust schema definitions depending on dataset format (joined vs single-table).
-
-3. **Data Source**
-
-   * The dataset used is **Corporación Favorita** (available on [Kaggle](https://www.kaggle.com/c/favorita-grocery-sales-forecasting)).
-   * Preprocessing steps are provided in `EDA and Preprocessing/Preprocessing.ipynb`.
-   * Processed tables should be loaded into PostgreSQL before training.
-
-4. **Running the In-Database ML**
-
-   * Execute the SQL scripts inside `In Database ML/Join aware` or `Single table` sequentially:
-
-     ```sql
-     \i train_regression_tree.sql
-     \i evaluate_treee.sql
-     ```
-   * Predictions can be queried directly within PostgreSQL.
-
-5. **Running Baselines**
-
-   * Open Jupyter notebooks in `Baselines/` and run either the **RPART** or **Scikit-Learn** implementations.
-   * These provide benchmarks against the in-database implementation.
+This creates the required schema and tables. Data must be preloaded before running training queries.
 
 ---
 
-## 📊 Outputs
+## Repository layout
 
-* Predictions and evaluation metrics are generated inside PostgreSQL (queried via SQL).
-* `Visualisation.ipynb` plots results and comparisons across implementations.
-* Outputs are **not included** in this repository (due to size) but can be regenerated by following the steps above.
+```
+Baselines/                       # Classical baselines
+  ├── RPART/
+  │   ├── RPART with joins.ipynb         # R-based regression tree on joined schema
+  │   └── RPART with single table.ipynb  # R-based regression tree on flat table
+  └── SCIKIT LEARN/
+      ├── Scikit Learn with joins.ipynb        # sklearn regression tree on joined schema
+      └── Scikit Learn with single table.ipynb # sklearn regression tree on flat table
+
+EDA and Preprocessing/
+  └── Preprocessing.ipynb           # Data cleaning, feature engineering, and formatting
+
+In Database ML/
+  ├── Join aware/
+  │   ├── dt_schema.sql             # Schema definition for join-aware training
+  │   ├── build_tree_recursive_joined.sql
+  │   ├── calculate_node_stats_joined.sql
+  │   ├── evaluate_tree_joined.sql
+  │   ├── find_best_categorical_split_joined.sql
+  │   ├── find_best_split_all_features_joined.sql
+  │   ├── train_regression_tree_joined.sql
+  │   └── dt_c_extension.txt        # Notes on PostgreSQL C-extension for optimisation
+  │
+  ├── Single table/
+  │   ├── build_tree_recursive.sql
+  │   ├── traverse_tree_from_json.sql
+  │   ├── train_regression_tree.sql
+  │   ├── evaluate_treee.sql
+  │   ├── predict_tree.sql
+  │   ├── find_all_numeric_splits_one_pass.sql
+  │   ├── find_best_categorical_split.sql
+  │   ├── find_best_split_all_features.sql
+  │   └── Evaluation.py             # Python evaluation/benchmark script
+  │
+  └── Visualisation.ipynb           # Results visualisation and comparisons
+```
 
 ---
 
-## 🔑 Key Features
+## Data provenance
 
-* Implementation of CART regression trees *fully inside PostgreSQL*.
-* Support for both **single table** and **join-aware** schemas.
-* Baseline comparisons with industry-standard tools (Scikit-Learn & RPART).
-* Modular SQL functions for training, prediction, and evaluation.
-* Reproducible preprocessing and visualization workflows.
+* **Dataset used:** [Corporación Favorita Grocery Sales Forecasting](https://www.kaggle.com/c/favorita-grocery-sales-forecasting)
+* **Processing:**
 
----
+  * Cleaning, feature engineering, and restructuring in `EDA and Preprocessing/Preprocessing.ipynb`
+  * Data exported to CSV/SQL for PostgreSQL loading
+* **Usage in project:**
 
-## 🚀 How to Extend
-
-* Replace the dataset in preprocessing with any relational table of your choice.
-* Extend SQL scripts to handle classification trees.
-* Optimize tree-building functions with PostgreSQL C extensions (`dt_c_extension.txt` has notes).
+  * Both **joined schema** (relational) and **single-table schema** tested
+* **Note:** No large datasets or outputs are included in this repo; they can be regenerated by following preprocessing steps.
 
 ---
 
-## 📜 License
+## Running experiments
 
-This project is for **educational and research purposes**.
-Please cite appropriately if you use or adapt this work.
+### 1. Baselines
+
+Run notebooks in `Baselines/` to generate benchmark models. These also provide visualizations for baselines.
+
+Example:
+
+```bash
+jupyter notebook "Baselines/SCIKIT LEARN/Scikit Learn with single table.ipynb"
+```
+```bash
+jupyter notebook "Baselines/RPART/RPART with single table.ipynb"
+```
+
+### 2. In-database ML (Single Table)
+
+Inside PostgreSQL:
+Load the data in the database.
+Create all functions by running the sql files.
+Add the c extension files by creating a c make file.
+
+Example run to train the data:
+```sql
+SELECT diss_joins.train_regression_tree('favorita_tree_v1', 'unit_sales', 4, 100);
+```
+Example run to evaluate the data:
+```sql
+SELECT diss_joins.predict_tree('favorita_tree_v1', 'diss_joins.test_data');
+```
+
+### 3. In-database ML (Join Aware)
+
+Inside PostgreSQL:
+Load the data in the database.
+Create all functions by running the sql files.
+Add the c extension files by creating a c make file.
+
+Example run to train the data:
+```sql
+SELECT diss_joins.train_regression_tree_joined('favorita_tree_v1', 'unit_sales', 4, 100);
+```
+Example run to evaluate the data:
+```sql
+SELECT diss_joins.evaluate_tree_joined('favorita_tree_v1', 'diss_joins.test_data');
+```
+### 4. Visualisation for In Database ML
+
+Generate plots and evaluation tables:
+
+```bash
+jupyter notebook "In Database ML/Visualisation.ipynb"
+```
+
+---
+
+## What gets saved
+
+* Outputs (predictions, metrics) are generated within PostgreSQL and can be exported as tables.
+* `Visualisation.ipynb` produces plots in-database.
+* `Scikit Learn with single table.ipynb` and other baseline notebooks produces plots for baseline runs.
+
+---
+
+## Reproducing results (order)
+
+1. Run preprocessing (`EDA and Preprocessing/Preprocessing.ipynb`) for single table data and preprocessing.
+2. Load processed data into PostgreSQL
+3. Train and evaluate using either **Single table** or **Join aware** SQL scripts
+4. Run baselines (RPART, Scikit-Learn) for comparison
+5. Generate visualisations
+6. Run evaluation.py
+
+---
+
+## Submission & archive notes
+
+When archiving this project:
+
+**Include:**
+
+* All source code (`Baselines/`, `EDA and Preprocessing/`, `In Database ML/`)
+* This `README.md`
+* Environment details (`requirements.txt`, R library list)
+
+**Exclude (unless required):**
+
+* Large raw datasets (Kaggle download)
+* Large outputs / model checkpoints (reproducible from code)
+
+**How to regenerate outputs:**
+
+1. Follow **Environment & install**
+2. Run preprocessing notebook
+3. Execute SQL training/evaluation scripts
+4. Reproduce visualisations
+
+---
+
+## License & citation
+
+* **License:** Educational use only — The University of Edinburgh
+* If you use this repo, please cite:
+  *Decision Tree in PostgreSQL for In-Database Machine Learning* (MSc Project, University of Edinburgh, 2025)
+
+---
+
+## Repro checklist
+
+* [ ] PostgreSQL database set up and schema loaded
+* [ ] Python 3.9+ environment created with required packages
+* [ ] R environment available with `rpart` installed
+* [ ] Data preprocessed and loaded into PostgreSQL
+* [ ] SQL training and evaluation scripts executed successfully
+* [ ] Visualisation notebook run and figures generated
+* [ ] Archive prepared (source code + README, no large data/artifacts)
+

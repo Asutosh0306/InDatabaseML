@@ -1,0 +1,454 @@
+#include "postgres.h"
+#include "fmgr.h"
+#include "utils/builtins.h"
+#include "catalog/pg_type.h"
+#include "utils/memutils.h"
+#include "math.h"
+#include "utils/numeric.h"
+#include "utils/array.h"
+#include "utils/lsyscache.h"
+#include "access/hash.h"
+
+#ifdef PG_MODULE_MAGIC
+PG_MODULE_MAGIC;
+#endif
+
+/* State structure for variance calculation */
+typedef struct VarianceState
+{
+    int64   count;
+    double  sum;
+    double  sum_of_squares;
+} VarianceState;
+
+/* State structure for split evaluation */
+typedef struct SplitEvalState
+{
+    double  threshold;
+    int64   total_count;
+    double  total_sum;
+    double  total_sum_of_squares;
+    int64   left_count;
+    double  left_sum;
+    double  left_sum_of_squares;
+    int64   right_count;
+    double  right_sum;
+    double  right_sum_of_squares;
+} SplitEvalState;
+
+/* Hash table entry for category statistics */
+typedef struct CategoryStats {
+    int32   category;           /* key */
+    int64   count;
+    double  sum;
+    double  sum_of_squares;
+    struct CategoryStats *next; /* for collision handling */
+} CategoryStats;
+
+/* Simple hash table structure */
+typedef struct CategoryHashTable {
+    CategoryStats **buckets;
+    int32   n_buckets;
+    int32   n_entries;
+    MemoryContext context;
+} CategoryHashTable;
+
+/* State for categorical split evaluation */
+typedef struct CategoricalSplitState
+{
+    int64   total_count;
+    double  total_sum;
+    double  total_sum_of_squares;
+    CategoryHashTable *hash_table;
+} CategoricalSplitState;
+
+/* Function declarations */
+PG_FUNCTION_INFO_V1(variance_transfn);
+PG_FUNCTION_INFO_V1(variance_transfn_numeric);
+PG_FUNCTION_INFO_V1(variance_finalfn);
+PG_FUNCTION_INFO_V1(variance_finalfn_sample);
+PG_FUNCTION_INFO_V1(split_eval_transfn);
+PG_FUNCTION_INFO_V1(split_eval_finalfn);
+PG_FUNCTION_INFO_V1(categorical_split_transfn);
+PG_FUNCTION_INFO_V1(categorical_split_finalfn);
+
+/*
+ * Transition function for float8
+ */
+Datum
+variance_transfn(PG_FUNCTION_ARGS)
+{
+    MemoryContext aggcontext;
+    VarianceState* state;
+    double new_value;
+
+    if (!AggCheckCallContext(fcinfo, &aggcontext))
+        elog(ERROR, "variance_transfn called in non-aggregate context");
+
+    if (PG_ARGISNULL(1))
+        PG_RETURN_POINTER(PG_GETARG_POINTER(0));
+
+    new_value = PG_GETARG_FLOAT8(1);
+
+    if (PG_ARGISNULL(0))
+    {
+        state = (VarianceState*)MemoryContextAllocZero(aggcontext, sizeof(VarianceState));
+    }
+    else
+    {
+        state = (VarianceState*)PG_GETARG_POINTER(0);
+    }
+
+    state->count++;
+    state->sum += new_value;
+    state->sum_of_squares += (new_value * new_value);
+
+    PG_RETURN_POINTER(state);
+}
+
+/*
+ * Transition function for numeric
+ */
+Datum
+variance_transfn_numeric(PG_FUNCTION_ARGS)
+{
+    MemoryContext aggcontext;
+    VarianceState* state;
+    double new_value;
+
+    if (!AggCheckCallContext(fcinfo, &aggcontext))
+        elog(ERROR, "variance_transfn_numeric called in non-aggregate context");
+
+    if (PG_ARGISNULL(1))
+        PG_RETURN_POINTER(PG_GETARG_POINTER(0));
+
+    new_value = DatumGetFloat8(DirectFunctionCall1(numeric_float8, PG_GETARG_DATUM(1)));
+
+    if (PG_ARGISNULL(0))
+    {
+        state = (VarianceState*)MemoryContextAllocZero(aggcontext, sizeof(VarianceState));
+    }
+    else
+    {
+        state = (VarianceState*)PG_GETARG_POINTER(0);
+    }
+
+    state->count++;
+    state->sum += new_value;
+    state->sum_of_squares += (new_value * new_value);
+
+    PG_RETURN_POINTER(state);
+}
+
+/*
+ * Final function for population variance
+ */
+Datum
+variance_finalfn(PG_FUNCTION_ARGS)
+{
+    VarianceState* state;
+    double variance;
+
+    if (PG_ARGISNULL(0))
+        PG_RETURN_NULL();
+
+    state = (VarianceState*)PG_GETARG_POINTER(0);
+
+    if (state->count < 1)
+        PG_RETURN_NULL();
+
+    if (state->count == 1)
+        PG_RETURN_FLOAT8(0.0);
+
+    variance = (state->sum_of_squares - (state->sum * state->sum) / state->count) / state->count;
+
+    PG_RETURN_FLOAT8(variance);
+}
+
+/*
+ * Final function for sample variance
+ */
+Datum
+variance_finalfn_sample(PG_FUNCTION_ARGS)
+{
+    VarianceState* state;
+    double variance;
+
+    if (PG_ARGISNULL(0))
+        PG_RETURN_NULL();
+
+    state = (VarianceState*)PG_GETARG_POINTER(0);
+
+    if (state->count < 2)
+        PG_RETURN_NULL();
+
+    variance = (state->sum_of_squares - (state->sum * state->sum) / state->count) / (state->count - 1);
+
+    PG_RETURN_FLOAT8(variance);
+}
+
+/*
+ * Transition function for split evaluation
+ * Arguments: state, target_value, feature_value, threshold
+ */
+Datum
+split_eval_transfn(PG_FUNCTION_ARGS)
+{
+    MemoryContext aggcontext;
+    SplitEvalState* state;
+    double target_value, feature_value, threshold;
+
+    if (!AggCheckCallContext(fcinfo, &aggcontext))
+        elog(ERROR, "split_eval_transfn called in non-aggregate context");
+
+    /* Handle NULL inputs */
+    if (PG_ARGISNULL(1) || PG_ARGISNULL(2) || PG_ARGISNULL(3))
+        PG_RETURN_POINTER(PG_GETARG_POINTER(0));
+
+    target_value = PG_GETARG_FLOAT8(1);
+    feature_value = PG_GETARG_FLOAT8(2);
+    threshold = PG_GETARG_FLOAT8(3);
+
+    /* Initialize state on first call */
+    if (PG_ARGISNULL(0))
+    {
+        state = (SplitEvalState*)MemoryContextAllocZero(aggcontext, sizeof(SplitEvalState));
+        state->threshold = threshold;
+    }
+    else
+    {
+        state = (SplitEvalState*)PG_GETARG_POINTER(0);
+    }
+
+    /* Update total statistics */
+    state->total_count++;
+    state->total_sum += target_value;
+    state->total_sum_of_squares += (target_value * target_value);
+
+    /* Update left/right statistics based on threshold */
+    if (feature_value <= threshold)
+    {
+        state->left_count++;
+        state->left_sum += target_value;
+        state->left_sum_of_squares += (target_value * target_value);
+    }
+    else
+    {
+        state->right_count++;
+        state->right_sum += target_value;
+        state->right_sum_of_squares += (target_value * target_value);
+    }
+
+    PG_RETURN_POINTER(state);
+}
+
+/*
+ * Final function for split evaluation
+ * Returns variance reduction achieved by this split
+ */
+Datum
+split_eval_finalfn(PG_FUNCTION_ARGS)
+{
+    SplitEvalState* state;
+    double total_variance, left_variance, right_variance;
+    double weighted_variance, variance_reduction;
+
+    if (PG_ARGISNULL(0))
+        PG_RETURN_NULL();
+
+    state = (SplitEvalState*)PG_GETARG_POINTER(0);
+
+    if (state->total_count < 2 || state->left_count == 0 || state->right_count == 0)
+        PG_RETURN_FLOAT8(0.0);
+
+    /* Calculate total variance */
+    total_variance = (state->total_sum_of_squares -
+        (state->total_sum * state->total_sum) / state->total_count) /
+        state->total_count;
+
+    /* Calculate left variance */
+    if (state->left_count > 1)
+    {
+        left_variance = (state->left_sum_of_squares -
+            (state->left_sum * state->left_sum) / state->left_count) /
+            state->left_count;
+    }
+    else
+    {
+        left_variance = 0.0;
+    }
+
+    /* Calculate right variance */
+    if (state->right_count > 1)
+    {
+        right_variance = (state->right_sum_of_squares -
+            (state->right_sum * state->right_sum) / state->right_count) /
+            state->right_count;
+    }
+    else
+    {
+        right_variance = 0.0;
+    }
+
+    /* Calculate weighted variance */
+    weighted_variance = (state->left_count * left_variance +
+        state->right_count * right_variance) / state->total_count;
+
+    /* Variance reduction = original variance - weighted variance */
+    variance_reduction = total_variance - weighted_variance;
+
+    PG_RETURN_FLOAT8(variance_reduction);
+}
+
+/* Hash table helper functions */
+static uint32
+hash_int32(int32 key, int32 n_buckets)
+{
+    return ((uint32)key * 2654435761U) % n_buckets;
+}
+
+static CategoryHashTable*
+create_category_hash_table(MemoryContext context, int32 initial_buckets)
+{
+    CategoryHashTable *ht;
+    
+    ht = (CategoryHashTable*)MemoryContextAllocZero(context, sizeof(CategoryHashTable));
+    ht->n_buckets = initial_buckets;
+    ht->n_entries = 0;
+    ht->context = context;
+    ht->buckets = (CategoryStats**)MemoryContextAllocZero(context, 
+                                    initial_buckets * sizeof(CategoryStats*));
+    
+    return ht;
+}
+
+static CategoryStats*
+hash_table_insert(CategoryHashTable *ht, int32 category)
+{
+    uint32 hash;
+    CategoryStats *entry;
+    
+    hash = hash_int32(category, ht->n_buckets);
+    
+    /* Search for existing entry */
+    for (entry = ht->buckets[hash]; entry != NULL; entry = entry->next)
+    {
+        if (entry->category == category)
+            return entry;
+    }
+    
+    /* Create new entry */
+    entry = (CategoryStats*)MemoryContextAllocZero(ht->context, sizeof(CategoryStats));
+    entry->category = category;
+    entry->count = 0;
+    entry->sum = 0.0;
+    entry->sum_of_squares = 0.0;
+    
+    /* Insert at head of bucket */
+    entry->next = ht->buckets[hash];
+    ht->buckets[hash] = entry;
+    ht->n_entries++;
+    
+    return entry;
+}
+
+/*
+ * Transition function for categorical split evaluation
+ * Arguments: state, target_value, category_value
+ */
+Datum
+categorical_split_transfn(PG_FUNCTION_ARGS)
+{
+    MemoryContext aggcontext;
+    CategoricalSplitState* state;
+    double target_value;
+    int32 category;
+    CategoryStats *entry;
+
+    if (!AggCheckCallContext(fcinfo, &aggcontext))
+        elog(ERROR, "categorical_split_transfn called in non-aggregate context");
+
+    /* Handle NULL inputs */
+    if (PG_ARGISNULL(1) || PG_ARGISNULL(2))
+        PG_RETURN_POINTER(PG_GETARG_POINTER(0));
+
+    target_value = PG_GETARG_FLOAT8(1);
+    category = PG_GETARG_INT32(2);
+
+    /* Initialize state on first call */
+    if (PG_ARGISNULL(0))
+    {
+        state = (CategoricalSplitState*)MemoryContextAllocZero(aggcontext, 
+                                                                sizeof(CategoricalSplitState));
+        /* Create hash table with 1024 initial buckets (good for up to ~4000 categories) */
+        state->hash_table = create_category_hash_table(aggcontext, 1024);
+    }
+    else
+    {
+        state = (CategoricalSplitState*)PG_GETARG_POINTER(0);
+    }
+
+    /* Update total statistics */
+    state->total_count++;
+    state->total_sum += target_value;
+    state->total_sum_of_squares += (target_value * target_value);
+
+    /* Find or create category entry */
+    entry = hash_table_insert(state->hash_table, category);
+    
+    /* Update category statistics */
+    entry->count++;
+    entry->sum += target_value;
+    entry->sum_of_squares += (target_value * target_value);
+
+    PG_RETURN_POINTER(state);
+}
+
+/*
+ * Final function for categorical split evaluation
+ * Returns total variance of all categories (for finding best categorical split)
+ */
+Datum
+categorical_split_finalfn(PG_FUNCTION_ARGS)
+{
+    CategoricalSplitState* state;
+    double total_variance, category_variance, weighted_variance = 0.0;
+    CategoryStats *entry;
+    int i;
+
+    if (PG_ARGISNULL(0))
+        PG_RETURN_NULL();
+
+    state = (CategoricalSplitState*)PG_GETARG_POINTER(0);
+
+    if (state->total_count < 2)
+        PG_RETURN_FLOAT8(0.0);
+
+    /* Calculate total variance */
+    total_variance = (state->total_sum_of_squares -
+        (state->total_sum * state->total_sum) / state->total_count) /
+        state->total_count;
+
+    /* Calculate weighted sum of variances for each category */
+    for (i = 0; i < state->hash_table->n_buckets; i++)
+    {
+        for (entry = state->hash_table->buckets[i]; entry != NULL; entry = entry->next)
+        {
+            if (entry->count > 1)
+            {
+                category_variance = (entry->sum_of_squares -
+                    (entry->sum * entry->sum) / entry->count) /
+                    entry->count;
+            }
+            else
+            {
+                category_variance = 0.0;
+            }
+            
+            weighted_variance += (entry->count * category_variance) / state->total_count;
+        }
+    }
+
+    /* Return variance reduction */
+    PG_RETURN_FLOAT8(total_variance - weighted_variance);
+}
